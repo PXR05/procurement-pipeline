@@ -1,0 +1,197 @@
+name: procurement
+
+x-pipeline: &pipeline
+  image: procurement-pipeline:0.1.0
+  build:
+    context: .
+    target: pipeline
+  environment: &pipeline-environment
+    BD_DATA_DIR: /data
+    BD_OUTPUT_DIR: /output
+    HDFS_NAMENODE: http://namenode:9870
+    HDFS_USER: root
+    RAW_ARCHIVE: ${RAW_ARCHIVE:-/inputs/opentender-2023.jsonl.gz}
+    CONTEXT_DIR: ${CONTEXT_DIR:-/inputs/context}
+    PYTHONUNBUFFERED: "1"
+  volumes: &pipeline-volumes
+    - ${INPUT_DIR:-./inputs}:/inputs:ro
+    - ./data:/data
+    - ./output:/output
+  networks:
+    - hadoop
+  depends_on:
+    namenode:
+      condition: service_healthy
+    datanode:
+      condition: service_healthy
+
+services:
+  namenode:
+    image: bde2020/hadoop-namenode:2.0.0-hadoop3.2.1-java8
+    hostname: namenode
+    ports:
+      - "127.0.0.1:${NAMENODE_WEB_PORT:-9870}:9870"
+      - "127.0.0.1:${NAMENODE_RPC_PORT:-8020}:8020"
+    volumes:
+      - namenode-data:/hadoop/dfs/name
+    environment:
+      CLUSTER_NAME: procurement
+      CORE_CONF_fs_defaultFS: hdfs://namenode:8020
+      HDFS_CONF_dfs_namenode_name_dir: file:///hadoop/dfs/name
+      HDFS_CONF_dfs_replication: "1"
+      HDFS_CONF_dfs_webhdfs_enabled: "true"
+    networks:
+      - hadoop
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9870/jmx >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 40s
+
+  datanode:
+    image: bde2020/hadoop-datanode:2.0.0-hadoop3.2.1-java8
+    hostname: datanode
+    depends_on:
+      namenode:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:${DATANODE_WEB_PORT:-9864}:9864"
+    volumes:
+      - datanode-data:/hadoop/dfs/data
+    environment:
+      CORE_CONF_fs_defaultFS: hdfs://namenode:8020
+      HDFS_CONF_dfs_datanode_data_dir: file:///hadoop/dfs/data
+      HDFS_CONF_dfs_datanode_hostname: datanode
+      HDFS_CONF_dfs_replication: "1"
+      SERVICE_PRECONDITION: namenode:9870
+    networks:
+      - hadoop
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:9864/jmx >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 40s
+
+  pipeline:
+    <<: *pipeline
+    profiles: [batch]
+    command:
+      - /bin/sh
+      - -ec
+      - python scripts/reproduce.py --raw-archive "$$RAW_ARCHIVE" --context-dir "$$CONTEXT_DIR" && python scripts/sync_hdfs.py
+
+  hdfs-sync:
+    <<: *pipeline
+    profiles: [batch]
+    command: [python, scripts/sync_hdfs.py]
+
+  postgres:
+    image: postgres:17.6
+    profiles: [serving]
+    environment:
+      POSTGRES_DB: procurement
+      POSTGRES_USER: procurement
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-procurement-local}
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-55432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - hadoop
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U procurement -d procurement"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  neo4j:
+    image: neo4j:5.26.0-community
+    profiles: [serving]
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:-procurement-local}
+      NEO4J_server_memory_heap_initial__size: 256m
+      NEO4J_server_memory_heap_max__size: 512m
+      NEO4J_server_memory_pagecache_size: 256m
+    ports:
+      - "127.0.0.1:${NEO4J_HTTP_PORT:-7474}:7474"
+      - "127.0.0.1:${NEO4J_BOLT_PORT:-7687}:7687"
+    volumes:
+      - neo4j-data:/data
+      - ./output:/import:ro
+    networks:
+      - hadoop
+    healthcheck:
+      test: ["CMD-SHELL", "cypher-shell -u neo4j -p \"$${NEO4J_AUTH#*/}\" 'RETURN 1' >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 30s
+
+  airflow-db:
+    image: postgres:17.6
+    profiles: [orchestration]
+    environment:
+      POSTGRES_DB: airflow
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: ${AIRFLOW_DB_PASSWORD:-airflow-local}
+    volumes:
+      - airflow-db-data:/var/lib/postgresql/data
+    networks:
+      - hadoop
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow -d airflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  airflow:
+    image: procurement-airflow:0.1.0
+    build:
+      context: .
+      target: airflow
+    profiles: [orchestration]
+    environment:
+      <<: *pipeline-environment
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:${AIRFLOW_DB_PASSWORD:-airflow-local}@airflow-db:5432/airflow
+      AIRFLOW__API__BASE_URL: http://localhost:${AIRFLOW_PORT:-8080}
+      AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://localhost:8080/execution/
+    volumes:
+      - ${INPUT_DIR:-./inputs}:/inputs:ro
+      - ./data:/data
+      - ./output:/output
+      - airflow-state:/opt/airflow
+      - ./infra/airflow/dags:/opt/airflow/dags:ro
+    ports:
+      - "127.0.0.1:${AIRFLOW_PORT:-8080}:8080"
+    networks:
+      - hadoop
+    depends_on:
+      airflow-db:
+        condition: service_healthy
+      namenode:
+        condition: service_healthy
+      datanode:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/api/v2/monitor/health', timeout=5)"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 90s
+
+volumes:
+  namenode-data:
+  datanode-data:
+  postgres-data:
+  neo4j-data:
+  airflow-db-data:
+  airflow-state:
+
+networks:
+  hadoop:
+    driver: bridge

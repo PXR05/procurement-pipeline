@@ -1,0 +1,11 @@
+.venv
+.uv-cache
+.git
+__pycache__
+**/__pycache__
+.ruff_cache
+data
+output
+inputs
+.env
+.env.*
